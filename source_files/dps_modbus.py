@@ -1,4 +1,4 @@
-import minimalmodbus
+import minimalmodbus, serial
 import time
 import csv
 
@@ -14,22 +14,26 @@ these limits prevent the program from issuing silly values.
 '''
 class Import_limits:
 	def __init__(self, filename):
+		self._read_file(filename)
+		self._read_file(self.device_config)
+		
+	def _read_file(self, filename):
 		Config = ConfigParser.ConfigParser()
-		Config.read(filename)
-		b = Config.options('SectionOne')		# safety limits
-		for x in range(len(b)):
-			c = b[x]
-			exec("self.%s = %s" % (c, Config.get('SectionOne', c)))	
-		
-		b = Config.options('SectionTwo')		# decimal places
-		for x in range(len(b)):
-			c = b[x]
-			exec("self.%s = %s" % (c, Config.get('SectionTwo', c)))
-		
-		b = Config.options('SectionThree')		# plot colours
-		for x in range(len(b)):
-			c = b[x]
-			exec("self.%s = %s" % (c, Config.get('SectionThree', c)))			
+		found_files = Config.read(filename)
+		if len(found_files) == 0:
+			print(f"Config file '{filename}' not found. Potential fix: start the program directly from the containing folder.")
+			quit()
+		sections = [
+			"SectionOne",
+			"SectionTwo",
+			"SectionThree",
+		]
+		for section in sections:
+			if section in Config.sections():
+				options = Config.options(section)		
+				for i in range(len(options)):
+					key = options[i]
+					exec("self.%s = %s" % (key, Config.get(section, key)))		
 
 '''
 # original inspiration for this came from here:
@@ -38,20 +42,28 @@ class Import_limits:
 # Requires minimalmodbus library from: https://github.com/pyhys/minimalmodbus
 '''		
 class Serial_modbus:
-	def __init__(self, port1, addr, baud_rate, byte_size ):
-		self.instrument = minimalmodbus.Instrument(port1, addr) # port name, slave address (in decimal)
-		#self.instrument.serial.port          # this is the serial port name
-		self.instrument.serial.baudrate = baud_rate   # Baud rate 9600 as listed in doc
-		self.instrument.serial.bytesize = byte_size
-		self.instrument.serial.timeout = 0.5     # This had to be increased from the default setting else it did not work !
-		self.instrument.mode = minimalmodbus.MODE_RTU  #RTU mode
+	def __init__(self, port, addr, baud_rate, byte_size, timeout = 0.5):
+		self.instrument = minimalmodbus.Instrument(
+			serial.Serial(port, baud_rate, byte_size, serial.PARITY_NONE, 1,  timeout),
+			addr,
+			minimalmodbus.MODE_RTU
+		)
+
+		time.sleep(0.016) # ensure silent interval before any message is sent
+		# see https://minimalmodbus.readthedocs.io/en/stable/serialcommunication.html?highlight=silent
+		# temporary solution until https://github.com/pyhys/minimalmodbus/issues/141 is resolved
+		# even with the proposed solution, this delay increases the success rate of the first message from 82% to 98% for the XY-SK120
+
+	def close(self):
+		self.instrument.serial.close()
+		pass
 
 	def read(self, reg_addr, decimal_places):
 		return self.instrument.read_register(reg_addr, decimal_places)
 		
 	def read_block(self, reg_addr, size_of_block):
 		return self.instrument.read_registers(reg_addr, size_of_block)
-			
+
 	def write(self, reg_addr, value, decimal_places):
 		self.instrument.write_register(reg_addr, value, decimal_places) # register, value, No_of_decimal_places
 	
@@ -83,65 +95,75 @@ class Dps5005:
 		return self.function(0x05, self.limits.decimals_vin)
 
 	def lock(self, RWaction='r', value=0):	# R/W
-		return self.function(0x06, 0, RWaction, value, self.limits.lock_set_max, self.limits.lock_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+		return self.function(15, 0, RWaction, value, self.limits.lock_set_max, self.limits.lock_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 
 	def protect(self):	# R
-		return self.function(0x07, 0)
+		return self.function(0x16, 0)
 
 	def cv_cc(self):	# R
-		return self.function(0x08, 0)
+		return self.function(17, 0)
 
 	def onoff(self, RWaction='r', value=0):	# R/W
-		return self.function(0x09, 0, RWaction, value, self.limits.onoff_set_max, self.limits.onoff_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+		return self.function(18, 0, RWaction, value, self.limits.onoff_set_max, self.limits.onoff_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 		
 	def b_led(self, RWaction='r', value=0):	# R/W
 		return self.function(0x0A, 0, RWaction, value, self.limits.b_led_set_max, self.limits.b_led_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 
 	def model(self):	# R
-		return self.function(0x0B, 0)
+		return self.function(22, 0)
 
 	def version(self):	# R
-		return self.function(0x0C, self.limits.decimals_version)
+		version = str(self.function(23, 0))
+		for i in range(self.limits.decimals_version):
+			n = i*2+1
+			version = version[:-n] + '.' + version[-n:]	# version
+		return version
 
-	def extract_m(self, RWaction='r', value=0.0):	# R/W
-		return self.function(0x23, 0, RWaction, value, self.limits.extract_m_set_max, self.limits.extract_m_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def extract_m(self, RWaction='r', value=0.0):	# R/W
+		# return self.function(0x23, 0, RWaction, value, self.limits.extract_m_set_max, self.limits.extract_m_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 				
-#---		
+# #---		
 		
-	def voltage_set2(self, RWaction='r', value=0.0):	# R/W
-		return self.function(0x50, self.limits.decimals_vset, RWaction, value, self.limits.voltage_set2_max, self.limits.voltage_set2_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def voltage_set2(self, RWaction='r', value=0.0):	# R/W
+		# return self.function(0x50, self.limits.decimals_vset, RWaction, value, self.limits.voltage_set2_max, self.limits.voltage_set2_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 			
-	def current_set2(self, RWaction='r', value=0.0):	# R/W
-		return self.function(0x51, self.limits.decimals_iset, RWaction, value, self.limits.current_set2_max, self.limits.current_set2_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def current_set2(self, RWaction='r', value=0.0):	# R/W
+		# return self.function(0x51, self.limits.decimals_iset, RWaction, value, self.limits.current_set2_max, self.limits.current_set2_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 
-	def s_ovp(self, RWaction='r', value=0):	# R/W
-		return self.function(0x52, self.limits.decimals_ovp, RWaction, value, self.limits.s_ovp_set_max, self.limits.s_ovp_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def s_ovp(self, RWaction='r', value=0):	# R/W
+		# return self.function(0x52, self.limits.decimals_ovp, RWaction, value, self.limits.s_ovp_set_max, self.limits.s_ovp_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 		
-	def s_ocp(self, RWaction='r', value=0):	# R/W
-		return self.function(0x53, self.limits.decimals_ocp, RWaction, value, self.limits.s_ocp_set_max, self.limits.s_ocp_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def s_ocp(self, RWaction='r', value=0):	# R/W
+		# return self.function(0x53, self.limits.decimals_ocp, RWaction, value, self.limits.s_ocp_set_max, self.limits.s_ocp_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 
-	def s_opp(self, RWaction='r', value=0):	# R/W
-		return self.function(0x54, self.limits.decimals_opp, RWaction, value, self.limits.s_opp_set_max, self.limits.s_opp_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def s_opp(self, RWaction='r', value=0):	# R/W
+		# return self.function(0x54, self.limits.decimals_opp, RWaction, value, self.limits.s_opp_set_max, self.limits.s_opp_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 
-	def b_led2(self, RWaction='r', value=0):	# R/W
-		return self.function(0x55, 0, RWaction, value, self.limits.b_led2_set_max, self.limits.b_led2_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def b_led2(self, RWaction='r', value=0):	# R/W
+		# return self.function(0x55, 0, RWaction, value, self.limits.b_led2_set_max, self.limits.b_led2_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 
-	def m_pre(self, RWaction='r', value=0):	# R/W
-		return self.function(0x56, 0, RWaction, value, self.limits.m_pre_set_max, self.limits.m_pre_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	# def m_pre(self, RWaction='r', value=0):	# R/W
+		# return self.function(0x56, 0, RWaction, value, self.limits.m_pre_set_max, self.limits.m_pre_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
 	
-	def s_ini(self, RWaction='r', value=0):	# R/W
-		return self.function(0x57, 0, RWaction, value, self.limits.s_ini_set_max, self.limits.s_ini_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
-
+	# def s_ini(self, RWaction='r', value=0):	# R/W
+		# return self.function(0x57, 0, RWaction, value, self.limits.s_ini_set_max, self.limits.s_ini_set_min) # reg_addr, decimal_places, RWaction, value, max_value, min_value
+	
 	def read_all(self, RWaction='r', value=0.0):	# Read data as a block, much faster than individual reads
-		data = self.functions(0x00, 16, RWaction, value) # reg_addr, number of bytes, RWaction, value
+		data = self.functions(0x00, 30, RWaction, value) # reg_addr, number of bytes, RWaction, value
 		#--- adjust values to floating points
-		data[0] = data[0] / float(10**self.limits.decimals_vset)	#100.0	# voltage_set
-		data[1] = data[1] / float(10**self.limits.decimals_iset)	#1000.0	# current_set
-		data[2] = data[2] / float(10**self.limits.decimals_v)	#100.0	# voltage
-		data[3] = data[3] / float(10**self.limits.decimals_i)	#1000.0	# current
-		data[4] = data[4] / float(10**self.limits.decimals_power)	#100.0	# power
-		data[5] = data[5] / float(10**self.limits.decimals_vin)	#100.0	# voltage_in
-		data[12] = data[12] / float(10**self.limits.decimals_version)	#10.0	# version
+		data[0] = data[0] / float(10**self.limits.decimals_vset)	# voltage_set
+		data[1] = data[1] / float(10**self.limits.decimals_iset)	# current_set
+		data[2] = data[2] / float(10**self.limits.decimals_v)		# voltage
+		data[3] = data[3] / float(10**self.limits.decimals_i)		# current
+		data[4] = data[4] / float(10**self.limits.decimals_power)	# power
+		data[5] = data[5] / float(10**self.limits.decimals_vin)	 	# voltage_in
+		data[13] = data[13] / float(10**self.limits.decimals_temp_internal)	# temperature internal
+		data[8] = data[8] / float(10**self.limits.decimals_energy)	# energy
+
+		data[23] = str(data[23])
+		for i in range(self.limits.decimals_version):
+			n = i*2+1
+			data[23] = data[23][:-n] + '.' + data[23][-n:]	# version
 		return data
 	
 	def write_voltage_current(self, RWaction='r', value=0):	# write voltage & current as a block
@@ -202,7 +224,20 @@ class Dps5005:
 				time_old = time.time()
 				break
 			time.sleep(0.01)
-			
+
+	def check_model(self, verbose = True):
+		model = self.model()
+		model_hex = hex(model)[2:]
+		expected_model_strings = [str(number) for number in self.limits.model_numbers]
+		match = model_hex in expected_model_strings
+		if verbose:
+			if match:
+				print(f"Model number {model_hex} matches with config file for Model {self.limits.model_name}.")
+			else:
+				print(f"Model number {model_hex} is not in the list of expected numbers {self.limits.model_numbers} for the configured model {self.limits.model_name}. Please verify that your configuration is correct.")
+		return match
+
+	
 	def action_csv_file(self, filename='sample.csv', value=0):
 		try:
 			with open(filename, 'r') as f:
@@ -237,12 +272,19 @@ class Dps5005:
 This file can operate independently controlling the DPS via the commandline however the GUI is much simpler.
 '''
 if __name__ == '__main__':
-	ser = Serial_modbus('/dev/ttyUSB1', 1, 9600, 8)
-	limits = Import_limits("dps5005_limits.ini")
+	limits = Import_limits("config.ini")
+
+	try:
+		print("Serial port: "+limits.port_set)
+		ser = Serial_modbus(limits.port_set, 1, 115200, 8)
+	except Exception as e:
+		print(f"Could not open the serial port '{limits.port_set}'.")
+		print(e.args)
+		quit()
 	dps = Dps5005(ser, limits)
 	try:
 		while True:
-			route = raw_input("Enter command: ")
+			route = input("Enter command: ")
 			if route == "q":
 				quit()
 			elif route == "read":
@@ -250,15 +292,16 @@ if __name__ == '__main__':
 				print(dps.read_all())
 				print(time.time() - start)	
 			elif route == "write":
-				value = [23.47, 1.234]
+				value = [23.47, 1.23]
 				dps.write_voltage_current('w', value)
 			elif route == "r":
-				start = time.time()
+				print("The amount of decimal places shown here may not be correct")
+				#start = time.time()
 				print("voltage_set :  %6.2f" % dps.voltage_set())
-				print(time.time() - start)
+				#print(time.time() - start)
 				print("current_set :  %6.3f" % dps.current_set())	
 				print("voltage     :  %6.2f" % dps.voltage())
-				print("current     :  %6.2f" % dps.current())
+				print("current     :  %6.3f" % dps.current())
 				print("power       :  %6.2f" % dps.power())
 				print("voltage_in  :  %6.2f" % dps.voltage_in())
 		
@@ -266,49 +309,49 @@ if __name__ == '__main__':
 				print("protection  :  %6s" % dps.protect())	
 				print("cv_cc       :  %6s" % dps.cv_cc())
 				print("onoff       :  %6s" % dps.onoff())
-				print("b_led       :  %6s" % dps.b_led())
-				print("model       :  %6s" % dps.model())
+				#print("b_led       :  %6s" % dps.b_led())
+				print("model       :  %6x" % dps.model())
 				print("version     :  %6s" % dps.version())
-				print("extract_m   :  %6s" % dps.extract_m())
+				# print("extract_m   :  %6s" % dps.extract_m())
 				
-				print("voltage_set2:  %6s" % dps.voltage_set2())	
-				print("current_set2:  %6s" % dps.current_set2())
-				print("s_ovp       :  %6s" % dps.s_ovp())
-				print("s_ocp       :  %6s" % dps.s_ocp())
-				print("s_opp       :  %6s" % dps.s_opp())
-				print("b_led2      :  %6s" % dps.b_led2())
-				print("m_pre       :  %6s" % dps.m_pre())
-				print("s_ini       :  %6s" % dps.s_ini())
+				# print("voltage_set2:  %6s" % dps.voltage_set2())	
+				# print("current_set2:  %6s" % dps.current_set2())
+				# print("s_ovp       :  %6s" % dps.s_ovp())
+				# print("s_ocp       :  %6s" % dps.s_ocp())
+				# print("s_opp       :  %6s" % dps.s_opp())
+				# print("b_led2      :  %6s" % dps.b_led2())
+				# print("m_pre       :  %6s" % dps.m_pre())
+				# print("s_ini       :  %6s" % dps.s_ini())
 				
 			elif route == "vset":
-				value = raw_input("Enter value: ")
+				value = input("Enter value: ")
 				dps.voltage_set('w', float(value))
 			elif route == "iset":
-				value = raw_input("Enter value: ")
+				value = input("Enter value: ")
 				dps.current_set('w', float(value))
 			elif route == "lock":
-				value = raw_input("Enter value: ")
+				value = input("Enter value: ")
 				dps.lock('w', float(value))
 			elif route == "on":
 				dps.onoff('w', 1)
 			elif route == "off":
 				dps.onoff('w', 0)		
-			elif route == "bled":
-				value = raw_input("Enter value: ")
-				dps.b_led('w', float(value))		
-			elif route == "sovp":
-				value = raw_input("Enter value: ")
-				dps.s_ovp('w', float(value))
-			elif route == "socp":
-				value = raw_input("Enter value: ")
-				dps.s_ocp('w', float(value))
-			elif route == "sopp":
-				value = raw_input("Enter value: ")
-				dps.s_opp('w', float(value))	
-			elif route == "sini":
-				value = raw_input("Enter value: ")
-				dps.s_ini('w', float(value))
-			elif route == "m":	
+			# elif route == "bled":
+				# value = input("Enter value: ")
+				# dps.b_led('w', float(value))		
+			# elif route == "sovp":
+				# value = input("Enter value: ")
+				# dps.s_ovp('w', float(value))
+			# elif route == "socp":
+				# value = input("Enter value: ")
+				# dps.s_ocp('w', float(value))
+			# elif route == "sopp":
+				# value = input("Enter value: ")
+				# dps.s_opp('w', float(value))	
+			# elif route == "sini":
+				# value = input("Enter value: ")
+				# dps.s_ini('w', float(value))
+			# elif route == "m":	
 				for i in dir(dps):
 					print(i)
 			elif route == "a":	
